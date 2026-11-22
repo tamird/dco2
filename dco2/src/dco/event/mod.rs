@@ -17,7 +17,7 @@ use crate::{
         CheckRun, CheckRunAction, CheckRunConclusion, CheckRunEvent, CheckRunEventAction, CheckRunStatus,
         Commit, Config, Ctx, DynGHClient, Event, LabelsPermissionError, MergeGroupEvent,
         MergeGroupEventAction, NewCheckRunInput, PullRequestEvent, PullRequestEventAction, PullRequestLabel,
-        TooManyCommitsError, is_rate_limit_error,
+        PullRequestState, TooManyCommitsError, is_rate_limit_error,
     },
 };
 
@@ -183,12 +183,30 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
         return Ok(());
     }
 
+    // Use a current base and head from the same pull request snapshot. An
+    // event's base can be stale after commits have landed on the base branch.
+    let PullRequestState {
+        base_sha,
+        head_sha,
+        is_open,
+        labels: _labels,
+    } = gh_client
+        .get_pull_request(&ctx, event.number)
+        .await
+        .context("error getting pull request")?;
+    if !is_open || head_sha != event.pull_request.head.sha {
+        debug!(
+            owner = %ctx.owner,
+            repo = %ctx.repo,
+            pr_number = event.number,
+            "pull request closed or head moved, skipping check"
+        );
+        return Ok(());
+    }
+
     // Get pull request commits (the check can't be run when there are too
     // many of them)
-    let commits = match gh_client
-        .compare_commits(&ctx, &event.pull_request.base.sha, &event.pull_request.head.sha)
-        .await
-    {
+    let commits = match gh_client.compare_commits(&ctx, &base_sha, &head_sha).await {
         Ok(commits) => Ok(commits),
         Err(err) => match too_many_commits_error(&err) {
             Some(too_many_commits_err) => Err(too_many_commits_err.clone()),
