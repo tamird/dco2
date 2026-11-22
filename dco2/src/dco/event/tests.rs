@@ -517,9 +517,10 @@ async fn pull_request_event_label_added_before_check_run_when_check_fails() {
     let event = pr_opened_event(&[]);
     let mut gh_client = MockGHClient::new();
     let commit = commit_with_signoff(false);
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(move |_, _, _| Box::pin(future::ready(Ok(vec![commit.clone()]))));
     gh_client
@@ -859,9 +860,10 @@ async fn pull_request_event_opened_action_error_getting_pr_commits() {
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| Box::pin(future::ready(Err(anyhow!("test error")))));
 
@@ -898,9 +900,10 @@ async fn pull_request_event_opened_action_error_getting_repository_configuration
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -964,9 +967,10 @@ async fn pull_request_event_opened_action_error_checking_user_organization_membe
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1032,9 +1036,10 @@ async fn pull_request_event_opened_action_error_creating_check_run() {
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1138,9 +1143,10 @@ async fn pull_request_event_opened_action_success_check_passed() {
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1218,9 +1224,10 @@ async fn pull_request_event_opened_action_success_check_passed_author_is_member(
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1314,9 +1321,10 @@ async fn pull_request_event_opened_action_success_check_failed_author_is_not_mem
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1403,9 +1411,10 @@ async fn pull_request_event_opened_action_success_check_passed_author_is_bot_mem
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1483,9 +1492,10 @@ async fn pull_request_event_opened_action_success_check_passed_author_membership
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![
@@ -1607,9 +1617,10 @@ async fn pull_request_event_opened_action_success_check_failed() {
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1690,9 +1701,10 @@ async fn pull_request_event_opened_action_success_check_failed_override_action_d
     };
 
     let mut gh_client = MockGHClient::new();
+    expect_pr_snapshot(&mut gh_client, &event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             Box::pin(future::ready(Ok(vec![Commit {
@@ -1833,7 +1845,7 @@ async fn pull_request_event_opened_action_too_many_commits_label_added() {
 }
 
 #[tokio::test]
-async fn pull_request_event_synchronize_action_runs_check() {
+async fn pull_request_event_synchronize_action_uses_current_base() {
     let event = PullRequestEvent {
         action: PullRequestEventAction::Synchronize,
         ..pr_opened_event(&[])
@@ -1842,6 +1854,38 @@ async fn pull_request_event_synchronize_action_runs_check() {
     expect_pr_check(&mut gh_client, &event, Config::default(), true);
 
     process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+}
+
+#[tokio::test]
+async fn pull_request_event_skipped_when_closed_or_head_moved() {
+    for pr in [
+        pr_state("head_sha", false, &[]),
+        pr_state("new_head_sha", true, &[]),
+    ] {
+        let event = pr_opened_event(&[]);
+        let mut gh_client = MockGHClient::new();
+        expect_get_pull_request(&mut gh_client, &event.ctx(), event.number, pr);
+        gh_client.expect_compare_commits().never();
+        gh_client.expect_create_check_run().never();
+
+        process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn pull_request_event_error_getting_current_state() {
+    let event = pr_opened_event(&[]);
+    let mut gh_client = MockGHClient::new();
+    gh_client
+        .expect_get_pull_request()
+        .with(eq(event.ctx()), eq(event.number))
+        .times(1)
+        .returning(|_, _| Box::pin(future::ready(Err(anyhow!("test error")))));
+    gh_client.expect_compare_commits().never();
+    gh_client.expect_create_check_run().never();
+
+    let err = process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap_err();
+    assert_eq!(err.to_string(), "error getting pull request");
 }
 
 // Helpers.
@@ -1935,6 +1979,16 @@ fn expect_override_check(gh_client: &mut MockGHClient, event: &CheckRunEvent, co
         .returning(|_, _| Box::pin(future::ready(Ok(()))));
 }
 
+// The current base differs from the event base to exercise stale events.
+fn expect_pr_snapshot(gh_client: &mut MockGHClient, event: &PullRequestEvent) {
+    expect_get_pull_request(
+        gh_client,
+        &event.ctx(),
+        event.number,
+        pr_state("head_sha", true, &[]),
+    );
+}
+
 fn expect_pr_check(gh_client: &mut MockGHClient, event: &PullRequestEvent, config: Config, passes: bool) {
     expect_pr_check_input(gh_client, event, vec![commit_with_signoff(passes)], config);
     let expected_conclusion = if passes {
@@ -1952,9 +2006,10 @@ fn expect_pr_check_input(
     commits: Vec<Commit>,
     config: Config,
 ) {
+    expect_pr_snapshot(gh_client, event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(move |_, _, _| Box::pin(future::ready(Ok(commits.clone()))));
     gh_client
@@ -1986,9 +2041,10 @@ fn expect_pr_check_run(
 /// Expect the pull request commits not to be fetched because there are too
 /// many of them, and the repository configuration to be fetched.
 fn expect_pr_too_many_commits(gh_client: &mut MockGHClient, event: &PullRequestEvent, config: Config) {
+    expect_pr_snapshot(gh_client, event);
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("base_sha"), eq("head_sha"))
+        .with(eq(event.ctx()), eq("current_base_sha"), eq("head_sha"))
         .times(1)
         .returning(|_, _, _| {
             let err = TooManyCommitsError { max: MAX_COMMITS };
@@ -2084,6 +2140,7 @@ fn pr_opened_event_in_org() -> PullRequestEvent {
 
 fn pr_state(head_sha: &str, is_open: bool, labels: &[&str]) -> PullRequestState {
     PullRequestState {
+        base_sha: "current_base_sha".to_string(),
         head_sha: head_sha.to_string(),
         is_open,
         labels: labels.iter().map(ToString::to_string).collect(),
