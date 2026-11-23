@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use askama::Template;
 use chrono::Utc;
 use tokio::time::timeout;
@@ -17,7 +17,7 @@ use crate::{
         CheckRun, CheckRunAction, CheckRunConclusion, CheckRunEvent, CheckRunEventAction, CheckRunStatus,
         Commit, Config, Ctx, DynGHClient, Event, LabelsPermissionError, MergeGroupEvent,
         MergeGroupEventAction, NewCheckRunInput, NotFoundError, PullRequestEvent, PullRequestEventAction,
-        PullRequestLabel, TooManyCommitsError, is_rate_limit_error,
+        PullRequestLabel, PullRequestState, TooManyCommitsError, is_rate_limit_error,
     },
 };
 
@@ -62,6 +62,16 @@ enum PullRequestCommits {
     TooManyCommits(TooManyCommitsError),
 }
 
+/// Current pull request inputs needed for a DCO check.
+struct PullRequestCheck<'a> {
+    number: i64,
+    base_ref: &'a str,
+    base_sha: &'a str,
+    head_ref: &'a str,
+    head_sha: &'a str,
+    labels: &'a [PullRequestLabel],
+}
+
 /// Input used to synchronize the label of a pull request. When the event
 /// includes the labels of the pull request, they are used to skip the
 /// synchronization if no change is needed.
@@ -86,9 +96,64 @@ async fn process_check_run_event(gh_client: DynGHClient, event: &CheckRunEvent) 
     let started_at = Utc::now();
     let ctx = event.ctx();
 
-    // Check if we are interested in the event action
-    if event.action != CheckRunEventAction::RequestedAction {
-        return Ok(());
+    match event.action {
+        CheckRunEventAction::Rerequested => {
+            let numbers = match event.check_run.external_id.as_ref().and_then(|id| id.parse::<i64>().ok()) {
+                Some(number) => {
+                    if number <= 0 {
+                        bail!("invalid pull request number in check run external id");
+                    }
+                    BTreeSet::from([number])
+                }
+                None => event
+                    .check_run
+                    .pull_requests
+                    .iter()
+                    .filter(|pr| pr.base.repo.id == event.repository.id && pr.number > 0)
+                    .map(|pr| pr.number)
+                    .collect(),
+            };
+            if numbers.is_empty() {
+                bail!("cannot identify the pull request for the re-requested check run");
+            }
+            let mut origin = None;
+            for number in numbers {
+                let pr =
+                    gh_client.get_pull_request(&ctx, number).await.context("error getting pull request")?;
+                if !pr.is_open || pr.head_sha != event.check_run.head_sha {
+                    continue;
+                }
+                if origin.is_some() {
+                    bail!("multiple current pull requests match the re-requested check run");
+                }
+                origin = Some((number, pr));
+            }
+            if let Some((number, pr)) = origin {
+                let PullRequestState {
+                    base_ref,
+                    base_sha,
+                    head_ref,
+                    head_sha,
+                    is_open: _,
+                    labels,
+                } = pr;
+                let labels: Vec<PullRequestLabel> =
+                    labels.into_iter().map(|name| PullRequestLabel { name }).collect();
+                let input = PullRequestCheck {
+                    number,
+                    base_ref: &base_ref,
+                    base_sha: &base_sha,
+                    head_ref: &head_ref,
+                    head_sha: &head_sha,
+                    labels: &labels,
+                };
+                let organization = event.organization.as_ref().map(|org| org.login.as_str());
+                check_pull_request(gh_client, &ctx, organization, &input).await?;
+            }
+            return Ok(());
+        }
+        CheckRunEventAction::RequestedAction => {}
+        CheckRunEventAction::Other => return Ok(()),
     }
 
     // Override: create check run with success status
@@ -122,21 +187,7 @@ async fn process_check_run_event(gh_client: DynGHClient, event: &CheckRunEvent) 
         // Remove the label from the pull requests associated with the check
         // run: the one it was created for (external id) and those reported
         // by GitHub that target this repository
-        let pr_numbers: BTreeSet<i64> = event
-            .check_run
-            .external_id
-            .iter()
-            .filter_map(|external_id| external_id.parse().ok())
-            .chain(
-                event
-                    .check_run
-                    .pull_requests
-                    .iter()
-                    .filter(|pr| pr.base.repo.id == event.repository.id)
-                    .map(|pr| pr.number),
-            )
-            .collect();
-        for pr_number in pr_numbers {
+        for pr_number in check_run_pull_requests(event) {
             let input = SyncLabelInput {
                 head_sha: &event.check_run.head_sha,
                 labels: None,
@@ -148,6 +199,25 @@ async fn process_check_run_event(gh_client: DynGHClient, event: &CheckRunEvent) 
     }
 
     Ok(())
+}
+
+/// Pull requests belonging to the check run's repository, including fork PRs
+/// identified only by the check's external id.
+fn check_run_pull_requests(event: &CheckRunEvent) -> BTreeSet<i64> {
+    event
+        .check_run
+        .external_id
+        .iter()
+        .filter_map(|external_id| external_id.parse().ok())
+        .chain(
+            event
+                .check_run
+                .pull_requests
+                .iter()
+                .filter(|pr| pr.base.repo.id == event.repository.id)
+                .map(|pr| pr.number),
+        )
+        .collect()
 }
 
 /// Process merge group event.
@@ -180,7 +250,6 @@ async fn process_merge_group_event(gh_client: DynGHClient, event: &MergeGroupEve
 
 /// Process pull request event.
 async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestEvent) -> Result<()> {
-    let started_at = Utc::now();
     let ctx = event.ctx();
 
     // Check if we are interested in the event action
@@ -193,9 +262,29 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
         return Ok(());
     }
 
+    let input = PullRequestCheck {
+        number: event.number,
+        base_ref: &event.pull_request.base.ref_,
+        base_sha: &event.pull_request.base.sha,
+        head_ref: &event.pull_request.head.ref_,
+        head_sha: &event.pull_request.head.sha,
+        labels: &event.pull_request.labels,
+    };
+    let organization = event.organization.as_ref().map(|org| org.login.as_str());
+    check_pull_request(gh_client, &ctx, organization, &input).await
+}
+
+/// Evaluate a pull request through the normal DCO and label policy.
+async fn check_pull_request(
+    gh_client: DynGHClient,
+    ctx: &Ctx,
+    organization: Option<&str>,
+    input: &PullRequestCheck<'_>,
+) -> Result<()> {
+    let started_at = Utc::now();
     // Get pull request commits (the check is skipped when no commits need
     // checking, and can't be run when there are too many of them)
-    let commits = match get_pull_request_commits(&gh_client, &ctx, event).await? {
+    let commits = match get_pull_request_commits(&gh_client, ctx, input).await? {
         PullRequestCommits::Commits(commits) => Ok(commits),
         PullRequestCommits::Skip => return Ok(()),
         PullRequestCommits::TooManyCommits(err) => Err(err),
@@ -203,7 +292,7 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
 
     // Get repository configuration
     let config = gh_client
-        .get_config(&ctx)
+        .get_config(ctx)
         .await
         .context("error getting repository configuration")?
         .unwrap_or_default();
@@ -214,7 +303,7 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
             // Create a list of members that are not required to sign-off commits
             let mut members = vec![];
             if !config.members_signoff_is_required() {
-                members = collect_members(gh_client.clone(), event, &commits)
+                members = collect_members(gh_client.clone(), ctx, organization, &commits)
                     .await
                     .context("error collecting members")?
             };
@@ -223,7 +312,7 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
             let input = CheckInput {
                 commits,
                 config: config.clone(),
-                head_ref: event.pull_request.head.ref_.clone(),
+                head_ref: input.head_ref.to_string(),
                 members,
             };
             let output = check(&input);
@@ -234,7 +323,7 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
             info!(
                 owner = %ctx.owner,
                 repo = %ctx.repo,
-                pr_number = event.number,
+                pr_number = input.number,
                 "too many commits in pull request, check not run"
             );
             (true, too_many_commits_summary(err.max))
@@ -261,8 +350,8 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
         actions,
         completed_at: Utc::now(),
         conclusion,
-        external_id: Some(event.number.to_string()),
-        head_sha: event.pull_request.head.sha.clone(),
+        external_id: Some(input.number.to_string()),
+        head_sha: input.head_sha.to_string(),
         name: CHECK_NAME.to_string(),
         started_at,
         status: CheckRunStatus::Completed,
@@ -274,15 +363,15 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
     // before creating the check run so that the override action can't be
     // used until the label has been synchronized
     let input = SyncLabelInput {
-        head_sha: &event.pull_request.head.sha,
-        labels: Some(&event.pull_request.labels),
-        pr_number: event.number,
+        head_sha: input.head_sha,
+        labels: Some(input.labels),
+        pr_number: input.number,
         should_be_labeled: check_failed,
     };
-    sync_label(&gh_client, &ctx, &config, &input).await;
+    sync_label(&gh_client, ctx, &config, &input).await;
 
     // Create check run
-    gh_client.create_check_run(&ctx, &check_run).await.context("error creating check run")?;
+    gh_client.create_check_run(ctx, &check_run).await.context("error creating check run")?;
 
     Ok(())
 }
@@ -290,15 +379,15 @@ async fn process_pull_request_event(gh_client: DynGHClient, event: &PullRequestE
 /// Create a list of members that are not required to sign-off commits.
 async fn collect_members(
     gh_client: DynGHClient,
-    event: &PullRequestEvent,
+    ctx: &Ctx,
+    organization: Option<&str>,
     commits: &[Commit],
 ) -> Result<Vec<String>> {
     let mut checked_authors = HashSet::new();
     let mut members = vec![];
 
     // If the repository belongs to an organization, collect its members
-    let ctx = event.ctx();
-    if let Some(org) = event.organization.as_ref().map(|o| o.login.as_str()) {
+    if let Some(org) = organization {
         for commit in commits {
             if !commit.verified.unwrap_or(false) {
                 continue;
@@ -309,7 +398,7 @@ async fn collect_members(
                 && checked_authors.insert(author_username.to_string())
             {
                 let is_member = gh_client
-                    .is_organization_member(&ctx, org, author_username)
+                    .is_organization_member(ctx, org, author_username)
                     .await
                     .context("error checking organization membership")?;
                 if is_member {
@@ -319,7 +408,7 @@ async fn collect_members(
         }
     } else {
         // Otherwise, the only member will be the repository owner
-        members.push(event.repository.owner.login.to_string());
+        members.push(ctx.owner.to_string());
     }
 
     Ok(members)
@@ -345,24 +434,24 @@ fn find_label<'a>(labels: impl IntoIterator<Item = &'a str>, label: &str) -> Opt
 async fn get_pull_request_commits(
     gh_client: &DynGHClient,
     ctx: &Ctx,
-    event: &PullRequestEvent,
+    input: &PullRequestCheck<'_>,
 ) -> Result<PullRequestCommits> {
     // Compare against the base branch ref first, handling empty comparisons
     // and missing refs before checking commits
-    let base_ref = format!("refs/heads/{}", event.pull_request.base.ref_);
-    let result = match gh_client.compare_commits(ctx, &base_ref, &event.pull_request.head.sha).await {
+    let base_ref = format!("refs/heads/{}", input.base_ref);
+    let result = match gh_client.compare_commits(ctx, &base_ref, input.head_sha).await {
         Ok(commits) if commits.is_empty() => {
             // Check current pull request state before falling back so closed
             // pull requests and stale heads are skipped
             let pr = gh_client
-                .get_pull_request(ctx, event.number)
+                .get_pull_request(ctx, input.number)
                 .await
                 .context("error getting pull request")?;
-            if !pr.is_open || pr.head_sha != event.pull_request.head.sha {
+            if !pr.is_open || pr.head_sha != input.head_sha {
                 debug!(
                     owner = %ctx.owner,
                     repo = %ctx.repo,
-                    pr_number = event.number,
+                    pr_number = input.number,
                     "pull request closed or head moved with no commits against base ref, skipping check"
                 );
                 return Ok(PullRequestCommits::Skip);
@@ -370,28 +459,26 @@ async fn get_pull_request_commits(
 
             // Re-compare against the current base branch ref when retargeted;
             // otherwise fall back to the event base commit SHA
-            if pr.base_ref != event.pull_request.base.ref_ {
+            if pr.base_ref != input.base_ref {
                 let current_base_ref = format!("refs/heads/{}", pr.base_ref);
                 debug!(
                     owner = %ctx.owner,
                     repo = %ctx.repo,
-                    pr_number = event.number,
-                    event_base_ref = %event.pull_request.base.ref_,
+                    pr_number = input.number,
+                    event_base_ref = %input.base_ref,
                     current_base_ref = %pr.base_ref,
                     "pull request base branch changed, comparing against current base ref"
                 );
-                gh_client.compare_commits(ctx, &current_base_ref, &event.pull_request.head.sha).await
+                gh_client.compare_commits(ctx, &current_base_ref, input.head_sha).await
             } else {
                 warn!(
                     owner = %ctx.owner,
                     repo = %ctx.repo,
-                    pr_number = event.number,
-                    base_ref = %event.pull_request.base.ref_,
+                    pr_number = input.number,
+                    base_ref = %input.base_ref,
                     "comparison against base branch ref returned no commits, falling back to base commit sha"
                 );
-                gh_client
-                    .compare_commits(ctx, &event.pull_request.base.sha, &event.pull_request.head.sha)
-                    .await
+                gh_client.compare_commits(ctx, input.base_sha, input.head_sha).await
             }
         }
         Err(err) if is_not_found_error(&err) => {
@@ -399,13 +486,11 @@ async fn get_pull_request_commits(
                 ?err,
                 owner = %ctx.owner,
                 repo = %ctx.repo,
-                pr_number = event.number,
-                base_ref = %event.pull_request.base.ref_,
+                pr_number = input.number,
+                base_ref = %input.base_ref,
                 "comparison against base branch ref not found, falling back to base commit sha"
             );
-            gh_client
-                .compare_commits(ctx, &event.pull_request.base.sha, &event.pull_request.head.sha)
-                .await
+            gh_client.compare_commits(ctx, input.base_sha, input.head_sha).await
         }
         result => result,
     };
@@ -417,7 +502,7 @@ async fn get_pull_request_commits(
             debug!(
                 owner = %ctx.owner,
                 repo = %ctx.repo,
-                pr_number = event.number,
+                pr_number = input.number,
                 "no commits to check in pull request, skipping check"
             );
             Ok(PullRequestCommits::Skip)

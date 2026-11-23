@@ -70,6 +70,7 @@ pub enum EventError {
 pub struct CheckRunEvent {
     pub action: CheckRunEventAction,
     pub check_run: CheckRunEventCheckRun,
+    pub organization: Option<Organization>,
     pub installation: Installation,
     pub repository: Repository,
     pub requested_action: Option<RequestedAction>,

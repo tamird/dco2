@@ -35,6 +35,99 @@ const MAX_COMMITS: usize = 1000;
 const TOO_MANY_COMMITS_SUMMARY: &str = "The check **did not pass**: this pull request contains too many commits to be checked (the maximum supported is 1000).";
 
 #[tokio::test]
+async fn check_run_rerequest_uses_current_origin_and_normal_policy() {
+    for (external_id, references) in [
+        (Some("42"), vec![]),
+        (Some("42"), vec![(43, 20)]),
+        (None, vec![(42, 20), (42, 20), (43, 99)]),
+    ] {
+        for passes in [false, true] {
+            let mut event = override_event(external_id, &references);
+            event.action = CheckRunEventAction::Rerequested;
+            let normal = pr_opened_event(&[]);
+            let mut gh_client = MockGHClient::new();
+            let mut current = pr_state("head_sha", true, &[]);
+            current.head_ref = "current_head".to_string();
+            expect_get_pull_request(&mut gh_client, &event.ctx(), 42, current);
+            expect_pr_check_input(
+                &mut gh_client,
+                &normal,
+                vec![commit_with_signoff(passes)],
+                Config::default(),
+            );
+            let expected = check(&CheckInput {
+                commits: vec![commit_with_signoff(passes)],
+                config: Config::default(),
+                head_ref: "current_head".to_string(),
+                members: vec![],
+            })
+            .render()
+            .unwrap();
+            gh_client
+                .expect_create_check_run()
+                .times(1)
+                .withf(move |_, run| {
+                    run.external_id() == Some("42")
+                        && run.head_sha() == "head_sha"
+                        && run.summary() == expected
+                        && run.conclusion()
+                            == &if passes {
+                                CheckRunConclusion::Success
+                            } else {
+                                CheckRunConclusion::ActionRequired
+                            }
+                })
+                .returning(|_, _| Box::pin(future::ready(Ok(()))));
+            process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_skips_closed_and_stale_heads() {
+    for (head, open) in [("head_sha", false), ("new_head", true)] {
+        let mut event = override_event(Some("42"), &[]);
+        event.action = CheckRunEventAction::Rerequested;
+        let mut gh_client = MockGHClient::new();
+        expect_get_pull_request(&mut gh_client, &event.ctx(), 42, pr_state(head, open, &[]));
+        process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_rejects_missing_and_ambiguous_origins() {
+    for references in [vec![], vec![(42, 20), (43, 20)]] {
+        let mut event = override_event(None, &references);
+        event.action = CheckRunEventAction::Rerequested;
+        let mut gh_client = MockGHClient::new();
+        for (number, _) in &references {
+            expect_get_pull_request(
+                &mut gh_client,
+                &event.ctx(),
+                *number,
+                pr_state("head_sha", true, &[]),
+            );
+        }
+        let err = process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap_err();
+        assert!(err.to_string().contains("pull request"), "{err:#}");
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_propagates_current_pr_error() {
+    let mut event = override_event(Some("42"), &[]);
+    event.action = CheckRunEventAction::Rerequested;
+    let mut gh_client = MockGHClient::new();
+    gh_client
+        .expect_get_pull_request()
+        .with(eq(event.ctx()), eq(42))
+        .times(1)
+        .returning(|_, _| Box::pin(future::ready(Err(anyhow!("request failed")))));
+    let err = process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap_err();
+    assert_eq!(format!("{err:#}"), "error getting pull request: request failed");
+}
+
+#[tokio::test]
 async fn check_run_event_other_action() {
     let event = CheckRunEvent {
         action: CheckRunEventAction::Other,
@@ -55,6 +148,7 @@ async fn check_run_event_requested_action_unknown_identifier() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -83,6 +177,7 @@ async fn check_run_event_requested_action_override_error_creating_check_run() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -146,6 +241,7 @@ async fn check_run_event_requested_action_override_ignored_when_disabled() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -354,6 +450,7 @@ async fn check_run_event_requested_action_override_success() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -2429,6 +2526,7 @@ fn override_event(external_id: Option<&str>, pull_requests: &[(i64, i64)]) -> Ch
                 })
                 .collect(),
         },
+        organization: None,
         installation: Installation { id: 10 },
         repository: Repository {
             id: 20,
@@ -2489,6 +2587,8 @@ fn pr_opened_event_in_org() -> PullRequestEvent {
 fn pr_state(head_sha: &str, is_open: bool, labels: &[&str]) -> PullRequestState {
     PullRequestState {
         base_ref: "base_ref".to_string(),
+        base_sha: "base_sha".to_string(),
+        head_ref: "head_ref".to_string(),
         head_sha: head_sha.to_string(),
         is_open,
         labels: labels.iter().map(ToString::to_string).collect(),

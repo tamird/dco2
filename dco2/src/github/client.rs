@@ -450,6 +450,8 @@ impl GHClient for GHClientOctorust {
 
         Ok(PullRequestState {
             base_ref: pr.base.ref_,
+            base_sha: pr.base.sha,
+            head_ref: pr.head.ref_,
             head_sha: pr.head.sha,
             is_open: pr.state == octorust::types::State::Open,
             labels: pr.labels.into_iter().map(|label| label.name).collect(),
@@ -961,6 +963,8 @@ impl Default for NotFoundError {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PullRequestState {
     pub base_ref: String,
+    pub base_sha: String,
+    pub head_ref: String,
     pub head_sha: String,
     pub is_open: bool,
     pub labels: Vec<String>,
