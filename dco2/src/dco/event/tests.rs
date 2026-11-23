@@ -35,6 +35,102 @@ const MAX_COMMITS: usize = 1000;
 const TOO_MANY_COMMITS_SUMMARY: &str = "The check **did not pass**: this pull request contains too many commits to be checked (the maximum supported is 1000).";
 
 #[tokio::test]
+async fn check_run_rerequest_uses_current_origin_and_normal_policy() {
+    for (external_id, references) in [
+        (Some("42"), vec![]),
+        (Some("42"), vec![(43, 20)]),
+        (None, vec![(42, 20), (42, 20), (43, 99)]),
+        (Some(""), vec![(42, 20)]),
+    ] {
+        for passes in [false, true] {
+            let mut event = override_event(external_id, &references);
+            event.action = CheckRunEventAction::Rerequested;
+            let mut normal = pr_opened_event(&[]);
+            normal.pull_request.base.ref_ = "current_base".to_string();
+            let mut gh_client = MockGHClient::new();
+            let mut current = pr_state("head_sha", true, &[]);
+            current.head_ref = "current_head".to_string();
+            current.base_ref = "current_base".to_string();
+            expect_get_pull_request(&mut gh_client, &event.ctx(), 42, current);
+            expect_pr_check_input(
+                &mut gh_client,
+                &normal,
+                vec![commit_with_signoff(passes)],
+                Config::default(),
+            );
+            let expected = check(&CheckInput {
+                commits: vec![commit_with_signoff(passes)],
+                config: Config::default(),
+                head_ref: "current_head".to_string(),
+                members: vec![],
+            })
+            .render()
+            .unwrap();
+            gh_client
+                .expect_create_check_run()
+                .times(1)
+                .withf(move |_, run| {
+                    run.external_id() == Some("42")
+                        && run.head_sha() == "head_sha"
+                        && run.summary() == expected
+                        && run.conclusion()
+                            == &if passes {
+                                CheckRunConclusion::Success
+                            } else {
+                                CheckRunConclusion::ActionRequired
+                            }
+                })
+                .returning(|_, _| Box::pin(future::ready(Ok(()))));
+            process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_skips_closed_and_stale_heads() {
+    for (head, open) in [("head_sha", false), ("new_head", true)] {
+        let mut event = override_event(Some("42"), &[]);
+        event.action = CheckRunEventAction::Rerequested;
+        let mut gh_client = MockGHClient::new();
+        expect_get_pull_request(&mut gh_client, &event.ctx(), 42, pr_state(head, open, &[]));
+        process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_rejects_missing_and_ambiguous_origins() {
+    for references in [vec![], vec![(42, 20), (43, 20)]] {
+        let mut event = override_event(None, &references);
+        event.action = CheckRunEventAction::Rerequested;
+        let mut gh_client = MockGHClient::new();
+        for (number, _) in &references {
+            expect_get_pull_request(
+                &mut gh_client,
+                &event.ctx(),
+                *number,
+                pr_state("head_sha", true, &[]),
+            );
+        }
+        let err = process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap_err();
+        assert!(err.to_string().contains("pull request"), "{err:#}");
+    }
+}
+
+#[tokio::test]
+async fn check_run_rerequest_propagates_current_pr_error() {
+    let mut event = override_event(Some("42"), &[]);
+    event.action = CheckRunEventAction::Rerequested;
+    let mut gh_client = MockGHClient::new();
+    gh_client
+        .expect_get_pull_request()
+        .with(eq(event.ctx()), eq(42))
+        .times(1)
+        .returning(|_, _| Box::pin(future::ready(Err(anyhow!("request failed")))));
+    let err = process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap_err();
+    assert_eq!(format!("{err:#}"), "error getting pull request: request failed");
+}
+
+#[tokio::test]
 async fn check_run_event_other_action() {
     let event = CheckRunEvent {
         action: CheckRunEventAction::Other,
@@ -55,6 +151,7 @@ async fn check_run_event_requested_action_unknown_identifier() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -83,6 +180,7 @@ async fn check_run_event_requested_action_override_error_creating_check_run() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -146,6 +244,7 @@ async fn check_run_event_requested_action_override_ignored_when_disabled() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -354,6 +453,7 @@ async fn check_run_event_requested_action_override_success() {
             head_sha: "head_sha".to_string(),
             pull_requests: vec![],
         },
+        organization: None,
         installation: Installation { id: 1 },
         repository: Repository {
             id: 1,
@@ -527,6 +627,12 @@ async fn merge_group_checks_requested_success() {
 
 #[tokio::test]
 async fn pull_request_event_label_added_before_check_run_when_check_fails() {
+    for rerequest in [false, true] {
+        check_pull_request_event_label_added_before_check_run_when_check_fails(rerequest).await;
+    }
+}
+
+async fn check_pull_request_event_label_added_before_check_run_when_check_fails(rerequest: bool) {
     let event = pr_opened_event(&[]);
     let mut gh_client = MockGHClient::new();
     let commit = commit_with_signoff(false);
@@ -567,7 +673,7 @@ async fn pull_request_event_label_added_before_check_run_when_check_fails() {
         .in_sequence(&mut seq)
         .returning(|_, _| Box::pin(future::ready(Ok(()))));
 
-    process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+    process_pr_check_event(gh_client, event, rerequest).await;
 }
 
 #[tokio::test]
@@ -717,6 +823,12 @@ async fn pull_request_event_label_permission_not_granted() {
 
 #[tokio::test]
 async fn pull_request_event_label_removed_when_check_passes() {
+    for rerequest in [false, true] {
+        check_pull_request_event_label_removed_when_check_passes(rerequest).await;
+    }
+}
+
+async fn check_pull_request_event_label_removed_when_check_passes(rerequest: bool) {
     let event = pr_opened_event(&["Needs-DCO"]);
     let mut gh_client = MockGHClient::new();
     expect_pr_check(&mut gh_client, &event, config_with_label(), true);
@@ -729,7 +841,7 @@ async fn pull_request_event_label_removed_when_check_passes() {
     );
     expect_remove_label(&mut gh_client, &event.ctx(), 42, "Needs-DCO");
 
-    process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+    process_pr_check_event(gh_client, event, rerequest).await;
 }
 
 #[tokio::test]
@@ -1202,6 +1314,12 @@ async fn pull_request_event_opened_action_success_check_passed() {
 
 #[tokio::test]
 async fn pull_request_event_opened_action_success_check_passed_author_is_member() {
+    for rerequest in [false, true] {
+        check_pull_request_event_opened_action_success_check_passed_author_is_member(rerequest).await;
+    }
+}
+
+async fn check_pull_request_event_opened_action_success_check_passed_author_is_member(rerequest: bool) {
     let event = PullRequestEvent {
         action: PullRequestEventAction::Opened,
         installation: Installation { id: 1 },
@@ -1281,11 +1399,20 @@ async fn pull_request_event_opened_action_success_check_passed_author_is_member(
         .times(1)
         .returning(|_, _| Box::pin(future::ready(Ok(()))));
 
-    process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+    process_pr_check_event(gh_client, event, rerequest).await;
 }
 
 #[tokio::test]
 async fn pull_request_event_opened_action_success_check_passed_author_is_repository_owner() {
+    for rerequest in [false, true] {
+        check_pull_request_event_opened_action_success_check_passed_author_is_repository_owner(rerequest)
+            .await;
+    }
+}
+
+async fn check_pull_request_event_opened_action_success_check_passed_author_is_repository_owner(
+    rerequest: bool,
+) {
     let event = pr_opened_event(&[]);
     let mut gh_client = MockGHClient::new();
     let commits = vec![commit_without_signoff(Some("owner"), Some(true))];
@@ -1293,7 +1420,7 @@ async fn pull_request_event_opened_action_success_check_passed_author_is_reposit
     gh_client.expect_is_organization_member().never();
     expect_pr_check_run(&mut gh_client, &event, CheckRunConclusion::Success);
 
-    process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+    process_pr_check_event(gh_client, event, rerequest).await;
 }
 
 #[tokio::test]
@@ -2250,6 +2377,59 @@ async fn pull_request_event_synchronize_action_uses_base_branch_ref() {
 
 // Helpers.
 
+/// Exercise the same normal policy fixtures through both webhook entry points.
+async fn process_pr_check_event(mut gh_client: MockGHClient, event: PullRequestEvent, rerequest: bool) {
+    if !rerequest {
+        process_event(Arc::new(gh_client), &Event::PullRequest(event)).await.unwrap();
+        return;
+    }
+    let ctx = event.ctx();
+    let PullRequestEvent {
+        action: _,
+        installation,
+        number,
+        organization,
+        pull_request,
+        repository,
+    } = event;
+    let PullRequest {
+        base,
+        head,
+        html_url: _,
+        labels,
+    } = pull_request;
+    let PullRequestBase {
+        ref_: base_ref,
+        sha: base_sha,
+    } = base;
+    let PullRequestHead {
+        ref_: head_ref,
+        sha: head_sha,
+    } = head;
+    let current = PullRequestState {
+        base_ref,
+        base_sha,
+        head_ref,
+        head_sha: head_sha.clone(),
+        is_open: true,
+        labels: labels.into_iter().map(|label| label.name).collect(),
+    };
+    expect_get_pull_request(&mut gh_client, &ctx, number, current);
+    let event = CheckRunEvent {
+        action: CheckRunEventAction::Rerequested,
+        check_run: CheckRunEventCheckRun {
+            external_id: Some(number.to_string()),
+            head_sha,
+            pull_requests: vec![],
+        },
+        organization,
+        installation,
+        repository,
+        requested_action: None,
+    };
+    process_event(Arc::new(gh_client), &Event::CheckRun(event)).await.unwrap();
+}
+
 fn commit_with_signoff(is_valid: bool) -> Commit {
     let signoff = if is_valid {
         "user1 <user1@email.test>"
@@ -2358,7 +2538,11 @@ fn expect_pr_check_input(
 ) {
     gh_client
         .expect_compare_commits()
-        .with(eq(event.ctx()), eq("refs/heads/base_ref"), eq("head_sha"))
+        .with(
+            eq(event.ctx()),
+            eq(format!("refs/heads/{}", event.pull_request.base.ref_)),
+            eq(event.pull_request.head.sha.clone()),
+        )
         .times(1)
         .returning(move |_, _, _| Box::pin(future::ready(Ok(commits.clone()))));
     gh_client
@@ -2429,6 +2613,7 @@ fn override_event(external_id: Option<&str>, pull_requests: &[(i64, i64)]) -> Ch
                 })
                 .collect(),
         },
+        organization: None,
         installation: Installation { id: 10 },
         repository: Repository {
             id: 20,
@@ -2489,6 +2674,8 @@ fn pr_opened_event_in_org() -> PullRequestEvent {
 fn pr_state(head_sha: &str, is_open: bool, labels: &[&str]) -> PullRequestState {
     PullRequestState {
         base_ref: "base_ref".to_string(),
+        base_sha: "base_sha".to_string(),
+        head_ref: "head_ref".to_string(),
         head_sha: head_sha.to_string(),
         is_open,
         labels: labels.iter().map(ToString::to_string).collect(),
