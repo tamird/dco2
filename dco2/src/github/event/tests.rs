@@ -49,6 +49,7 @@ fn check_run_event_with_external_id_and_pull_requests() {
             "pull_requests": [{"base": {"repo": {"id": 1}}, "id": 1, "number": 123}]
         },
         "installation": {"id": 1},
+        "organization": {"login": "owner"},
         "repository": {"id": 1, "name": "repo", "owner": {"login": "owner"}},
         "requested_action": {"identifier": "override"}
     }"#;
@@ -58,6 +59,12 @@ fn check_run_event_with_external_id_and_pull_requests() {
     };
 
     assert_eq!(event.action, CheckRunEventAction::RequestedAction);
+    assert_eq!(
+        event.organization,
+        Some(Organization {
+            login: "owner".to_string()
+        })
+    );
     assert_eq!(event.check_run.external_id.as_deref(), Some("123"));
     assert_eq!(
         event.check_run.pull_requests,
